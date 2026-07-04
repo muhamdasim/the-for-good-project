@@ -10,6 +10,12 @@ MODEL="${MODEL:-}"                       # optional model override
 PROVIDER="${PROVIDER:-}"                 # optional provider override (Hermes only)
 HERMES_PROFILE="${HERMES_PROFILE:-}"     # optional Hermes profile override
 AGENT_TIMEOUT="${AGENT_TIMEOUT:-2400}"   # seconds per agent run (0 = none)
+CLAIM_TTL="${CLAIM_TTL:-7200}"           # secs a claimed-but-undelivered issue is held before reap.sh frees it
+MAX_ACTIVE_STREAMS="${MAX_ACTIVE_STREAMS:-5}"  # streams worked concurrently before new roots wait in the backlog (#292)
+HIGH_PRIORITY_CAP="${HIGH_PRIORITY_CAP:-5}"    # max STREAMS whose 'priority: high' items jump the queue (#293)
+CLAIM_SETTLE="${CLAIM_SETTLE:-8}"        # base secs to let racing claimants' assignments settle before the tie-break
+REWORK_TTL="${REWORK_TTL:-7200}"         # secs a sent-back rework is held for its author before reap.sh frees it
+USAGE_LIMIT_SLEEP="${USAGE_LIMIT_SLEEP:-3600}"  # secs to back off when an agent hits an API usage/rate limit (60 min)
 REVIEW_CHECK_CONTEXT="for-good/adversarial-review"
 RUNS_AGENT="${RUNS_AGENT:-0}"             # scripts that call run_agent set this to 1
 
@@ -45,6 +51,9 @@ preflight() {
   done
   if [ "$RUNS_AGENT" = 1 ]; then
     command -v "$AGENT" >/dev/null 2>&1 || { err "agent '$AGENT' not on PATH (set AGENT=codex|claude|hermes)"; missing=1; }
+    if [ "$AGENT_TIMEOUT" != 0 ] && ! command -v timeout >/dev/null 2>&1 && ! command -v gtimeout >/dev/null 2>&1; then
+      warn "neither 'timeout' nor 'gtimeout' on PATH — AGENT_TIMEOUT=$AGENT_TIMEOUT will be IGNORED and a hung agent will wedge this runner (macOS: brew install coreutils)."
+    fi
   fi
   gh auth status >/dev/null 2>&1 || { err "gh is not authenticated — run: gh auth login"; missing=1; }
   [ "$missing" = 0 ] || exit 1
@@ -55,7 +64,14 @@ preflight() {
     err "Run this from inside a clone of $REPO (or set REPO_DIR to one)."
     exit 1
   fi
-  ME="$(gh api user --jq .login)"
+  if ! ME="$(gh api user --jq .login 2>/dev/null)"; then
+    if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+      ME="github-actions[bot]"
+    else
+      err "gh is authenticated, but couldn't resolve the current GitHub user."
+      exit 1
+    fi
+  fi
 }
 
 # ---- git worktree helpers ----
@@ -68,7 +84,23 @@ make_worktree() {  # $1 = ref to check out (e.g. origin/main, refs/fg/pr-12); se
   git -C "$REPO_DIR" fetch origin --quiet
   local parent; parent="$(mktemp -d "${TMPDIR:-/tmp}/fg-worktree.XXXXXX")"
   WORKTREE="$parent/repo"
-  git -C "$REPO_DIR" worktree add --quiet --detach "$WORKTREE" "$1"
+  # If `worktree add` fails (bad/missing ref), the dir never gets created —
+  # bail loudly and clear WORKTREE so callers never `cd` into a ghost path and
+  # run the agent against the wrong tree. Callers invoked with `|| true` disable
+  # `set -e` inside the function, so we can't rely on it aborting for us.
+  if ! git -C "$REPO_DIR" worktree add --quiet --detach "$WORKTREE" "$1"; then
+    err "worktree add failed for ref '$1'"
+    rm -rf "$parent" 2>/dev/null || true
+    WORKTREE=""
+    return 1
+  fi
+  # `git worktree add` does NOT populate submodules in the new worktree (each
+  # worktree tracks its own submodule checkout state) — without this, every
+  # agent gets an empty .skills/ and silently loses the NZ data CLIs even when
+  # correctly instructed to use them. Best-effort: a missing/offline submodule
+  # remote shouldn't fail the whole run, just leave .skills empty as before.
+  git -C "$WORKTREE" submodule update --init --quiet 2>/dev/null \
+    || warn "couldn't init the .skills submodule in $WORKTREE (offline? leaving it empty)"
 }
 
 remove_worktree() {
@@ -83,41 +115,137 @@ remove_worktree() {
 issue_labels()  { gh issue view "$1" --repo "$REPO" --json labels --jq '[.labels[].name]|join(",")'; }
 issue_field()   { gh issue view "$1" --repo "$REPO" --json "$2" --jq ".$2"; }
 
+# ONE GraphQL query for the whole open-issue queue, normalised to the same
+# shape `gh issue list --json number,createdAt,labels,assignees` returns so the
+# jq filters below are unchanged. A single poll cycle can fetch this once and
+# feed EVERY queue check (available / my rework / unassigned rework) from it,
+# instead of firing a separate REST list call per status. Capped at 100 (the
+# GraphQL page max) to match the previous --limit 100 behaviour; ordered NEWEST
+# first so that if the repo ever exceeds 100 open issues the truncation drops
+# the oldest, not the freshly-created available/rework work we most want to see.
+# (The jq filters re-sort deterministically, so fetch order doesn't affect the
+# result while the queue is under 100 — it only decides which slice survives the
+# cap.) labels(first:50) is ample headroom over the ~5 labels an issue carries.
+fetch_open_issues() {
+  gh api graphql -f query="{repository(owner:\"$OWNER\",name:\"$NAME\"){issues(states:OPEN,first:100,orderBy:{field:CREATED_AT,direction:DESC}){nodes{number createdAt labels(first:50){nodes{name}} assignees(first:10){nodes{login}}}}}}" \
+    --jq '[.data.repository.issues.nodes[] | {number, createdAt, labels: [.labels.nodes[] | {name}], assignees: [.assignees.nodes[] | {login}]}]'
+}
+
 # Numbers of open issues with a given status label, optional STAGE filter.
 # Order: issues labelled "priority: high" first, then oldest-created first.
 # This is the whole priority system — label an issue "priority: high" to have
 # the workers pick it up before the rest of the queue.
-issues_with_status() {  # $1 = bare status (e.g. available), $2.. extra gh flags
-  local status="$1"; shift
-  gh issue list --repo "$REPO" --state open --label "status: $status" "$@" \
-    --json number,createdAt,labels --limit 100 \
-    --jq "[.[] $( [ -n "${STAGE:-}" ] && printf '| select(.labels|map(.name)|index("stage: %s"))' "$STAGE" )] | sort_by((.labels|map(.name)|index(\"priority: high\")|not), .createdAt) | .[].number"
+#
+# BOUNDED (#293 / ADR-0013): "high" only means something while it is scarce.
+# The jump-queue honours priority: high for at most HIGH_PRIORITY_CAP
+# STREAMS at a time (grouped by stream:<n> label — or the issue's own number
+# when it has none — oldest high item first, computed over the whole open
+# queue so every runner agrees). High items beyond the cap sort by age like
+# everything else. Counting STREAMS (not issues) is deliberate so that
+# stream-level priority propagation (#164) can mark a whole stream high
+# without eating the entire cap, while blanket-labelling ten streams high
+# still cannot make "high" mean "everything".
+#
+# $2 = optional queue snapshot (from fetch_open_issues). Pass one to check
+# several statuses from a SINGLE GraphQL query; omit it and one is fetched.
+# $3 = optional stage filter; when omitted the STAGE env var applies (the
+# historical behaviour), so callers with a fixed queue (frame_work.sh's
+# discover queue) can pin the stage regardless of the caller's environment.
+# "do-not-automate" is a human's parking brake: an issue carrying it is
+# invisible to EVERY automation queue below, whatever its status. Purely
+# restrictive — it can only shrink queues.
+issues_with_status() {  # $1 = bare status (e.g. available); $2 = optional snapshot JSON; $3 = optional stage
+  local status="$1" snap="${2:-}" stage="${3-${STAGE:-}}"
+  [ -n "$snap" ] || snap="$(fetch_open_issues)"
+  printf '%s' "$snap" | jq -r --arg status "status: $status" --arg stage "$stage" --argjson cap "$HIGH_PRIORITY_CAP" '
+    def names: [.labels[].name];
+    def is_high: names | index("priority: high");
+    def stream_key: (names | map(select(startswith("stream:")) | ltrimstr("stream:")) | first) // (.number|tostring);
+    ([ .[] | select(is_high) | select(names | index("do-not-automate") | not) ]
+     | group_by(stream_key) | sort_by(map(.createdAt) | min) | .[:$cap] | [ .[][].number ]) as $jump
+    | [ .[]
+        | select(names | index($status))
+        | select(names | index("do-not-automate") | not)
+        | select($stage == "" or (names | index("stage: " + $stage))) ]
+    | sort_by(((.number as $n | $jump | index($n)) | not), .createdAt)
+    | .[].number'
 }
 
-available_issues() { issues_with_status "available"; }
+available_issues() { issues_with_status "available" "${1:-}"; }
+
+# Available DISCOVER roots — the framing queue (ADR-0014). Ordered like every
+# other queue (bounded priority jump, then age). Pins the stage explicitly, so
+# a caller's STAGE env can't widen it: this queue is discover by definition,
+# and it is frame_work.sh's alone — start_work.sh never claims discover roots.
+discover_roots() { issues_with_status "available" "${1:-}" "discover"; }
 
 # Issues a reviewer sent back that are assigned to *me* — my rework queue.
-rework_issues() { issues_with_status "changes-requested" --assignee "@me"; }
+# $1 = optional queue snapshot (from fetch_open_issues).
+rework_issues() {  # $1 = optional snapshot JSON
+  local snap="${1:-}"
+  [ -n "$snap" ] || snap="$(fetch_open_issues)"
+  printf '%s' "$snap" | jq -r --arg me "$ME" "[.[] | select(.labels|map(.name)|index(\"status: changes-requested\")) | select(.labels|map(.name)|index(\"do-not-automate\")|not) | select(.assignees|map(.login)|index(\$me))$( [ -n "${STAGE:-}" ] && printf ' | select(.labels|map(.name)|index("stage: %s"))' "$STAGE" )] | sort_by((.labels|map(.name)|index(\"priority: high\")|not), .createdAt) | .[].number"
+}
+
+# Reworks with NO assignee — freed by reap.sh after REWORK_TTL, so any worker
+# may take them (oldest first). The author's own reworks stay theirs (above).
+# $1 = optional queue snapshot (from fetch_open_issues).
+unassigned_reworks() {  # $1 = optional snapshot JSON
+  local snap="${1:-}"
+  [ -n "$snap" ] || snap="$(fetch_open_issues)"
+  printf '%s' "$snap" | jq -r '[.[] | select(.labels|map(.name)|index("status: changes-requested")) | select(.labels|map(.name)|index("do-not-automate")|not) | select((.assignees|length)==0)] | sort_by((.labels|map(.name)|index("priority: high")|not), .createdAt) | .[].number'
+}
 
 # Drained stream roots waiting for a G1 synthesis draft.
-synthesis_issues() { issues_with_status "needs-synthesis"; }
+# $1 = optional queue snapshot (from fetch_open_issues).
+synthesis_issues() { issues_with_status "needs-synthesis" "${1:-}"; }
+
+# ACTIVE streams (#292): the producer side scales with agents, the human
+# synthesis gate does not — so the number of streams being worked at once is
+# bounded by MAX_ACTIVE_STREAMS. A stream counts as active while it is
+# consuming producer capacity: it has OPEN CHILD issues, or its root is
+# actually being worked (claimed / in-review / changes-requested). A root
+# that is merely `status: available` is a G0-approved stream waiting for a
+# slot — start_work.sh holds it in the backlog until one frees up. Emits the
+# active stream root numbers, one per line, from a fetch_open_issues snapshot.
+active_streams() {  # $1 = queue snapshot JSON
+  printf '%s' "$1" | jq -r '
+    ( [ .[] as $i
+        | $i.labels[].name
+        | select(startswith("stream:"))
+        | ltrimstr("stream:")
+        | select(. != ($i.number|tostring)) ]        # open child work → its stream is active
+    + [ .[]
+        | select([.labels[].name] | index("stage: discover"))
+        | select([.labels[].name] | (index("status: claimed") or index("status: in-review") or index("status: changes-requested")))
+        | (.number|tostring) ] )                     # a root being worked → active even before children exist
+    | unique | .[]'
+}
 
 # First value of a "<prefix>..." entry in a comma-joined label list.
 label_field() {  # $1 = labels csv, $2 = prefix (e.g. "stage: ", "stream:")
   printf '%s' "$1" | tr ',' '\n' | sed -n "s/^$2//p" | head -1
 }
 
-# Depth of an issue in its stream: 0 for a root (no line-anchored "Part of #p"
-# in the body), else 1 + parent's depth, capped at 3 hops. Bounds agent
-# fan-out (docs/STREAMS.md). FAILS CLOSED: if gh errors mid-walk (rate limit,
-# network), reports the cap so fan-out is denied rather than unbounded.
+# Depth of an issue in its stream: 0 for a root, else 1 + parent's depth,
+# capped at 3 hops. Bounds agent fan-out (docs/STREAMS.md). The parent hop is
+# the line-anchored "Split from #m" if present, else "Part of #p" — under the
+# flattened linking convention (#291 / ADR-0013) every child's "Part of"
+# points at the STREAM ROOT (so roll-up is exact), while "Split from" records
+# which issue actually spawned it; depth must follow the SPAWN chain or a
+# grandchild that links the root would look depth-1 and fan out forever.
+# "Split from" may share the first line with "Part of #root." — the anchor
+# allows that one prefix so prose mentions still can't mis-parent an issue.
+# FAILS CLOSED: if gh errors mid-walk (rate limit, network), reports the cap
+# so fan-out is denied rather than unbounded.
 issue_depth() {  # $1 = issue number
   local n="$1" d=0 body parent
   while [ "$d" -lt 3 ]; do
     if ! body="$(gh issue view "$n" --repo "$REPO" --json body --jq .body 2>/dev/null)"; then
       echo 3; return
     fi
-    parent="$(printf '%s' "$body" | grep -oiE '^[[:space:]]*part of[[:space:]]*#[0-9]+' | head -1 | grep -oE '[0-9]+' || true)"
+    parent="$(printf '%s' "$body" | grep -oiE '^[[:space:]]*(part of[[:space:]]*#[0-9]+\.?[[:space:]]*)?split from[[:space:]]*#[0-9]+' | head -1 | grep -oE '[0-9]+$' || true)"
+    [ -z "$parent" ] && parent="$(printf '%s' "$body" | grep -oiE '^[[:space:]]*part of[[:space:]]*#[0-9]+' | head -1 | grep -oE '[0-9]+' || true)"
     [ -z "$parent" ] && break
     d=$((d+1)); n="$parent"
   done
@@ -138,9 +266,11 @@ review_feedback() {  # $1 = pr number
 # their issue (a stream ROOT must stay open for the life of the stream).
 # The fallback skips PRs that close some OTHER issue: child PRs carry
 # "Part of #<root>" too, and must not be mistaken for the root's framing PR.
+# Newest first — default order is oldest-first, which misses the just-opened
+# PR once >50 PRs are open.
 pr_for_issue() {
   local pr
-  pr="$(gh api graphql -f query="{repository(owner:\"$OWNER\",name:\"$NAME\"){pullRequests(states:OPEN,first:50){nodes{number closingIssuesReferences(first:10){nodes{number}}}}}}" \
+  pr="$(gh api graphql -f query="{repository(owner:\"$OWNER\",name:\"$NAME\"){pullRequests(states:OPEN,first:50,orderBy:{field:CREATED_AT,direction:DESC}){nodes{number closingIssuesReferences(first:10){nodes{number}}}}}}" \
     --jq ".data.repository.pullRequests.nodes[] | select(.closingIssuesReferences.nodes|map(.number)|index($1)) | .number" | head -1)"
   [ -n "$pr" ] && { echo "$pr"; return 0; }
   local cands c
@@ -152,25 +282,179 @@ pr_for_issue() {
   return 0
 }
 
-# Issue closed by a PR (first closing ref).
+# What KIND of review a PR needs, decided by the paths it changes:
+#  - "method"   → touches research/findings/** or solutions/**: the full
+#                 adversarial research method (cite everything, two sources, etc.)
+#  - "standard" → everything else (docs, tooling, web, analysis, .github,
+#                 streams overviews): review like a normal careful maintainer,
+#                 NOT against the research citation gate. This stops working
+#                 docs and scripts being held to a research-grade bar.
+# Fails to "standard" if the file list can't be read (never over-applies the
+# heavy gate to something we couldn't classify).
+pr_review_kind() {  # $1 = pr number
+  local files
+  files="$(gh pr view "$1" --repo "$REPO" --json files --jq '.files[].path' 2>/dev/null || true)"
+  if printf '%s\n' "$files" | grep -Eq '^(research/findings/|solutions/)'; then
+    echo method
+  else
+    echo standard
+  fi
+}
+
+# Is a PR a SYNTHESIS DRAFT? synthesize_work.sh always creates its branch as
+# synthesis/<slug>, so the head branch is the marker. Synthesis rework belongs
+# to synthesize_work.sh ONLY: the generic start_work.sh rework path uses the
+# research rework prompt (no steward-preservation rules) and parks the stream
+# root at "in-review" — a status a root must never hold, because a synthesis
+# PR has no closing ref so nothing ever clears it.
+# Returns 0 = synthesis, 1 = not synthesis, 2 = UNKNOWN (gh failed). Callers
+# guarding the generic path must fail CLOSED: treat 2 as "don't touch it this
+# loop", never as "not synthesis" — or a transient API blip re-opens the very
+# routing bug this helper exists to prevent (ADR-0011).
+pr_is_synthesis() {  # $1 = pr number
+  local head
+  head="$(gh pr view "$1" --repo "$REPO" --json headRefName --jq .headRefName 2>/dev/null)" || head=""
+  [ -z "$head" ] && return 2
+  case "$head" in
+    synthesis/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Is a PR a DISCOVER FRAMING? Framing branches are always discover/<slug>
+# (frame_work.sh mints them that way, and the old start_work.sh discover
+# prompt used "$stage/<slug>" — same shape), so the head branch is the
+# marker, exactly like pr_is_synthesis. Framing rework belongs to
+# frame_work.sh ONLY (ADR-0014): the capability floor on setting a stream's
+# direction applies to REWORK of the framing too, so the general
+# start_work.sh loop must hand these off, never feed them its generic
+# research rework prompt.
+# Returns 0 = framing, 1 = not framing, 2 = UNKNOWN (gh failed). Callers
+# guarding the generic path must fail CLOSED on 2: "don't touch it this
+# loop", never "not a framing" (same contract as pr_is_synthesis).
+pr_is_framing() {  # $1 = pr number
+  local head
+  head="$(gh pr view "$1" --repo "$REPO" --json headRefName --jq .headRefName 2>/dev/null)" || head=""
+  [ -z "$head" ] && return 2
+  case "$head" in
+    discover/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Issue closed by a PR (first closing ref). Use this ONLY when you specifically
+# mean "the issue merging this PR will CLOSE" (e.g. marking it done) — discover
+# PRs have no closing ref by design, so this is empty for them.
 issue_for_pr() {
   gh api graphql -f query="{repository(owner:\"$OWNER\",name:\"$NAME\"){pullRequest(number:$1){closingIssuesReferences(first:5){nodes{number}}}}}" \
     --jq '.data.repository.pullRequest.closingIssuesReferences.nodes[0].number // empty'
 }
 
-set_status_label() {  # $1 issue, $2 new-status (bare, e.g. in-review), $3.. old statuses to remove
+# The issue a PR is WORKING (for routing rework/status back to the author): a
+# closing ref if there is one, else the "Closes/Part of #n" link in the PR body.
+# Unlike issue_for_pr this resolves DISCOVER PRs, which intentionally do NOT
+# close their stream-root issue (it must stay open for the stream's life) and so
+# carry only a "Part of #n" link. Use this for status hand-offs.
+issue_addressed_by_pr() {  # $1 = pr number
+  local n
+  n="$(issue_for_pr "$1")"
+  [ -n "$n" ] && { echo "$n"; return 0; }
+  gh pr view "$1" --repo "$REPO" --json body --jq .body 2>/dev/null \
+    | grep -oiE '(closes|fixes|resolves|part of)[[:space:]]*#[0-9]+' \
+    | grep -oE '[0-9]+' | head -1
+}
+
+# Jittered settle window: after a racy claim, wait long enough that every
+# competing claimant's `--add-assignee` is visible to all of them, so the
+# deterministic tie-break sees the same assignee set everywhere. The jitter
+# keeps two lock-stepped workers from reading at the exact same tick.
+claim_settle_secs() { echo $(( CLAIM_SETTLE + (RANDOM % 5) )); }
+
+# resolve_claim_race <issue> — call right after adding @me as assignee to claim
+# or adopt an issue. `--add-assignee` is a set-union, not a lock, so two workers
+# (different accounts) that both slipped past the pre-check end up co-assigned.
+# We settle, then break the tie deterministically: the smallest login wins.
+# It's a pure function of the observed assignee set, so every racer computes the
+# SAME winner with no coordination. Returns 0 if THIS worker holds the claim;
+# otherwise un-assigns @me and returns 1 so the caller yields.
+resolve_claim_race() {  # $1 = issue number
+  local n="$1" assignees winner
+  sleep "$(claim_settle_secs)"
+  assignees="$(gh issue view "$n" --repo "$REPO" --json assignees --jq '[.assignees[].login]|sort|join(" ")')"
+  winner="${assignees%% *}"
+  if [ -n "$winner" ] && [ "$winner" != "$ME" ]; then
+    warn "#$n was claimed concurrently (assignees: $assignees) — @$winner wins, yielding."
+    gh issue edit "$n" --repo "$REPO" --remove-assignee "@me" >/dev/null 2>&1 || true
+    return 1
+  fi
+  return 0
+}
+
+# Set an issue's lifecycle status ATOMICALLY (#289 / ADR-0013): compute the
+# full label set — everything the issue carries except the "status: "
+# namespace, plus the ONE new status — and replace the labels in a single
+# PUT call. The previous add-label + N remove-label form (even in one gh
+# invocation) applied adds and removes as separate mutations, leaving a
+# window where an issue held two status labels at once; interleaved
+# concurrent transitions could leave that soup behind permanently.
+# A read-modify-write can still race a concurrent edit of OTHER labels
+# (rare, self-limiting); the issue-status.yml reconciler and reap.sh's
+# conflict sweep converge any residue back to exactly one status label.
+# The closed set of statuses lives in .github/labels.yml.
+set_status_label() {  # $1 issue, $2 new-status (bare, e.g. in-review), $3.. ignored (legacy)
   local n="$1" new="$2"; shift 2
-  local args=(--add-label "status: $new")
-  for old in "$@"; do args+=(--remove-label "status: $old"); done
-  gh issue edit "$n" --repo "$REPO" "${args[@]}" >/dev/null
+  local keep
+  keep="$(gh issue view "$n" --repo "$REPO" --json labels \
+          --jq '[.labels[].name | select(startswith("status: ") | not)]')" || return 1
+  printf '%s' "$keep" | jq --arg s "status: $new" '{labels: (. + [$s])}' \
+    | gh api -X PUT "repos/$OWNER/$NAME/issues/$n/labels" --input - >/dev/null
+}
+
+# Remove EVERY "status: " label, keeping the rest — the "researching" posture
+# a stream root holds between its framing fan-out and the drain flagging it
+# needs-synthesis (docs/STREAMS.md). Same atomic whole-set PUT as
+# set_status_label, so it can't leave a partial label soup behind.
+clear_status_label() {  # $1 = issue
+  local n="$1" keep
+  keep="$(gh issue view "$n" --repo "$REPO" --json labels \
+          --jq '[.labels[].name | select(startswith("status: ") | not)]')" || return 1
+  printf '%s' "$keep" | jq '{labels: .}' \
+    | gh api -X PUT "repos/$OWNER/$NAME/issues/$n/labels" --input - >/dev/null
+}
+
+# True if an exit status means the agent was INTERRUPTED by the user (Ctrl-C) or
+# killed — the whole runner should stop, not move on to the next item. Note a
+# `timeout` (124) is deliberately NOT here: that fails one item but the loop
+# should carry on to the next. An agent that catches SIGINT itself and exits
+# 130/143 won't trip bash's own INT trap, so callers must check this after every
+# run_agent to stop reliably.
+was_interrupted() {  # $1 = exit status
+  case "$1" in 130|143) return 0 ;; *) return 1 ;; esac
+}
+
+# An agent that ran out of API budget (usage cap / provider rate limit) is a
+# TEMPORARY tooling condition, NOT a defect in the work — so callers must back
+# off and retry later instead of posting a failure or mangling issue/PR state.
+# Only the TAIL of the captured output is inspected: a real limit surfaces as a
+# fatal message at the very end of the run, so a finding that merely *discusses*
+# rate limits in its body won't trip this.
+was_usage_limited() {  # $1 = path to captured agent stdout+stderr
+  [ -s "${1:-}" ] || return 1
+  tail -n 40 "$1" | grep -qiE \
+    'usage limit|rate[ _-]?limit|too many requests|\b429\b|quota|overloaded|resource[_ ]exhausted|insufficient_quota|limit reached|try again later|retry after|resets? (at|in)'
 }
 
 # ---- agent runner ----
 # run_agent <prompt> [dir]  -> streams agent output to stdout; runs in [dir]
 # (usually a task worktree), falling back to the clone.
 run_agent() {
-  local prompt="$1" dir="${2:-$REPO_DIR}" tmo=""
-  if [ "$AGENT_TIMEOUT" != 0 ] && command -v timeout >/dev/null 2>&1; then tmo="timeout ${AGENT_TIMEOUT}s"; fi
+  local prompt="$1" dir="${2:-$REPO_DIR}" tmo="" t
+  # macOS ships no 'timeout'; coreutils installs it as 'gtimeout'.
+  if [ "$AGENT_TIMEOUT" != 0 ]; then
+    for t in timeout gtimeout; do
+      command -v "$t" >/dev/null 2>&1 && { tmo="$t ${AGENT_TIMEOUT}s"; break; }
+    done
+  fi
   case "$AGENT" in
     codex)
       $tmo codex exec --cd "$dir" --skip-git-repo-check \

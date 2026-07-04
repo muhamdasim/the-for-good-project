@@ -12,6 +12,28 @@ export interface Comment {
   avatar: string;
   body: string;
   createdAt: string;
+  url?: string;
+}
+
+// A single comment in the cross-repo live feed (see /live).
+export interface FeedComment {
+  author: string;
+  avatar: string;
+  isAgent: boolean;
+  body: string;
+  createdAt: string;
+  url: string;
+  issueNumber: number;
+  issueTitle: string;
+  isPR: boolean;
+}
+
+// Someone seen active recently, powering the "active now" strip.
+export interface ActiveActor {
+  login: string;
+  avatar: string;
+  isAgent: boolean;
+  at: string;
 }
 
 export interface IssueLite {
@@ -37,6 +59,7 @@ export interface IssueLite {
 
 export interface Contributor {
   login: string;
+  name?: string | null;
   avatar: string;
   url: string;
   issuesAssigned: number;
@@ -66,11 +89,35 @@ export interface Finding {
   author: string;
   agent: string;
   model: string;
+  issue: number | null;
   date: string;
   url: string;
   summary: string;
   body: string;
   sources: FindingSource[];
+}
+
+export interface StreamSummary {
+  stream: number;
+  title: string;
+  domain: string;
+  state: string;
+  steward: string;
+  updated: string;
+  image: string;
+  issues: number;
+  openIssues: number;
+  mergedPRs: number;
+  findings: number;
+  agents: Record<string, number>;
+  models: Record<string, number>;
+  people: Person[];
+  hasOverview: boolean;
+}
+
+export interface StreamsSummaryData {
+  generatedAt: string;
+  streams: StreamSummary[];
 }
 
 export interface SourceRef {
@@ -117,4 +164,31 @@ export interface Snapshot {
   findings: Finding[];
   sources: SourceRef[];
   activity: ActivityItem[];
+  comments: FeedComment[];
+  activeActors: ActiveActor[];
+  adrs?: Adr[];
+  streamDocs?: StreamDoc[];
+  streamsSummary?: StreamSummary[];
+}
+
+export interface StreamDoc {
+  stream: number;
+  title: string;
+  state: string;
+  steward: string;
+  domain: string;
+  updated: string;
+  image: string;
+  body: string;
+  url: string;
+}
+
+export interface Adr {
+  number: string;
+  slug: string;
+  title: string;
+  status: string;
+  date: string;
+  body: string;
+  url: string;
 }

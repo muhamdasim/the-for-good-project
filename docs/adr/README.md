@@ -40,5 +40,17 @@ routine fixes, copy changes, or web styling.
 | [0001](0001-streams-and-human-gates.md) | Streams + human gates: agents grind, humans steer | Accepted |
 | [0002](0002-vendor-thecolab-skills-submodule.md) | Vendor `thecolab-ai/.skills` as a git submodule | Accepted |
 | [0003](0003-agent-drafted-synthesis.md) | Agents draft the G1 synthesis; humans keep the decision | Accepted |
+| [0004](0004-analysis-documents-and-rendered-companions.md) | Project analysis lives in `analysis/` | Accepted |
+| [0005](0005-agent-execution-environment.md) | How & where we run the agents (containerise + sandboxed auto modes) | Accepted |
+| [0006](0006-fetch-proxy-browser-management.md) | Fetch, proxy & browser management for research + citation checks | Accepted |
+| [0007](0007-synthesis-drafts-candidate-outcomes.md) | Synthesis drafts candidate outcomes; the direction stays human | Accepted |
+| [0008](0008-rework-handoff-and-runner-interrupts.md) | Rework hand-off routes by worked issue; reviewer crashes retry; runner interrupts stop the run | Accepted |
+| [0009](0009-maintainer-escalation-handoff.md) | Agents hand off write-gated actions to maintainers via a documented escalation path | Accepted |
+| [0010](0010-partner-network.md) | Track the partner / SME / advisory network in the open, behind a consent gate | Accepted |
+| [0011](0011-synthesis-rework-routing.md) | Synthesis draft rework belongs to synthesize_work.sh; generic runners must not touch synthesis PRs | Accepted |
+| [0012](0012-synthesis-followup-research-loop.md) | Blocking unknowns loop back to research automatically — bounded — before the G1 human gate | Accepted |
+| [0013](0013-pipeline-guardrails.md) | Pipeline guardrails: bounded agent loops, one status at a time, human-held levers | Accepted |
+| [0014](0014-discover-framing-capability-floor.md) | Discover framing is reserved for a capability-floored runner (frame_work.sh) that also opens the fan-out | Proposed |
+| [0015](0015-autopilot-alternates-review-and-work.md) | autopilot.sh — one command alternates review and work, detects idle, and pulls latest main each cycle | Proposed |
 
 Start from [`TEMPLATE.md`](TEMPLATE.md).

@@ -24,9 +24,21 @@ const headers = {
   ...(TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {}),
 };
 
-async function gh(url) {
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function gh(url, attempt = 0) {
   const res = await fetch(url.startsWith("http") ? url : `${API}${url}`, { headers });
-  if (!res.ok) throw new Error(`GitHub API ${res.status} for ${url}: ${await res.text()}`);
+  if (!res.ok) {
+    // GitHub throttling (403 secondary-rate-limit / 429) and 5xx blips are
+    // transient — retry with backoff rather than failing the whole deploy.
+    if ((res.status === 403 || res.status === 429 || res.status >= 500) && attempt < 5) {
+      const ra = Number(res.headers.get("retry-after"));
+      const wait = ra > 0 ? ra * 1000 : Math.min(60000, 2000 * 2 ** attempt);
+      console.warn(`GitHub API ${res.status} for ${url} — retry ${attempt + 1}/5 in ${Math.round(wait / 1000)}s`);
+      await sleep(wait);
+      return gh(url, attempt + 1);
+    }
+    throw new Error(`GitHub API ${res.status} for ${url}: ${await res.text()}`);
+  }
   return res;
 }
 
@@ -54,6 +66,19 @@ function person(u) {
   return u ? { login: u.login, avatar: u.avatar_url, url: u.html_url } : null;
 }
 
+// Fold known alternate author spellings onto one canonical GitHub login, so a
+// contributor who ran an agent under different git credentials (e.g. an
+// overnight run with no GH creds) doesn't split into several leaderboard
+// people. Keyed by lowercased alias. Add a row here when it recurs.
+const AUTHOR_ALIASES = {
+  "richard-fortune": "richardofortune",
+  "richard fortune": "richardofortune",
+};
+function canonicalAuthor(a) {
+  const s = String(a || "").replace(/^@/, "").trim();
+  return AUTHOR_ALIASES[s.toLowerCase()] || s;
+}
+
 async function main() {
   console.log(`Building snapshot for ${REPO}${TOKEN ? " (authenticated)" : " (unauthenticated)"}`);
 
@@ -74,22 +99,40 @@ async function main() {
   // reviewer is not the PR author. Counted once per (reviewer, PR).
   const reviewsGiven = new Map();  // login -> Set(prNumbers)
   const reviewLast = new Map();    // login -> most recent review ISO timestamp
+  const reviewPeopleByPr = new Map(); // pr number -> Map(login -> Person)
+  const pathToAuthor = new Map(); // repo file path -> { login, merged, mergedAt } of the PR that added/last-touched it
+  const nameVotes = new Map();    // login -> Map(display name -> count), from commit author names
   try {
     let after = null;
     for (let i = 0; i < 10; i++) {
-      const q = `query($cursor:String){repository(owner:"${OWNER}",name:"${NAME}"){pullRequests(first:50,after:$cursor,states:[OPEN,MERGED,CLOSED]){pageInfo{hasNextPage endCursor} nodes{number author{login} reviews(first:50){nodes{author{login} state submittedAt}}}}}}`;
+      const q = `query($cursor:String){repository(owner:"${OWNER}",name:"${NAME}"){pullRequests(first:50,after:$cursor,states:[OPEN,MERGED,CLOSED]){pageInfo{hasNextPage endCursor} nodes{number mergedAt author{login} files(first:100){nodes{path}} commits(last:1){nodes{commit{author{name}}}} reviews(first:50){nodes{author{login avatarUrl url} state submittedAt}}}}}}`;
       const gres = await fetch(`${API}/graphql`, { method: "POST", headers, body: JSON.stringify({ query: q, variables: { cursor: after } }) });
       if (!gres.ok) { console.warn("reviews graphql:", gres.status); break; }
       const data = (await gres.json())?.data?.repository?.pullRequests;
       if (!data) break;
       for (const pr of data.nodes) {
         const prAuthor = pr.author?.login;
+        if (prAuthor) {
+          // Which GitHub user added/last-touched each file — the reliable author
+          // identity, independent of git user.name or finding frontmatter.
+          for (const fn of pr.files?.nodes || []) {
+            const p = fn.path, prev = pathToAuthor.get(p), merged = !!pr.mergedAt;
+            if (!prev || (merged && (!prev.merged || (pr.mergedAt || "") > (prev.mergedAt || "")))) {
+              pathToAuthor.set(p, { login: prAuthor, merged, mergedAt: pr.mergedAt });
+            }
+          }
+          // Vote for this user's display name from their commit's author name.
+          const nm = pr.commits?.nodes?.[0]?.commit?.author?.name;
+          if (nm) { const mv = nameVotes.get(prAuthor) || new Map(); mv.set(nm, (mv.get(nm) || 0) + 1); nameVotes.set(prAuthor, mv); }
+        }
         for (const rv of pr.reviews.nodes) {
           const who = rv.author?.login;
           if (!who || who === prAuthor) continue;
           if (rv.state !== "APPROVED" && rv.state !== "CHANGES_REQUESTED") continue;
           if (!reviewsGiven.has(who)) reviewsGiven.set(who, new Set());
           reviewsGiven.get(who).add(pr.number);
+          if (!reviewPeopleByPr.has(pr.number)) reviewPeopleByPr.set(pr.number, new Map());
+          reviewPeopleByPr.get(pr.number).set(who, { login: who, avatar: rv.author?.avatarUrl || "", url: rv.author?.url || `https://github.com/${who}` });
           const at = rv.submittedAt;
           if (at && (!reviewLast.has(who) || new Date(at) > new Date(reviewLast.get(who)))) reviewLast.set(who, at);
         }
@@ -98,6 +141,17 @@ async function main() {
       after = data.pageInfo.endCursor;
     }
   } catch (e) { console.warn("reviews unavailable:", e.message); }
+
+  // Harness/agent tokens that sometimes land in a finding's `author:` field —
+  // never real people, so they must not become leaderboard entries.
+  const HARNESS = new Set(["codex", "claude", "hermes", "hermes-agent", "none", "unknown", "human"]);
+  // The most common display name a GitHub user has committed under (e.g. Adam
+  // has no GitHub profile name but commits as "Adam Holt"). Falls back to login.
+  const mostCommonName = (login) => {
+    const mv = nameVotes.get(login);
+    if (!mv || mv.size === 0) return null;
+    return [...mv.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0][0];
+  };
 
   // --- issues + PRs ---
   const issues = [];
@@ -116,6 +170,7 @@ async function main() {
           avatar: c.user?.avatar_url || "",
           body: c.body || "",
           createdAt: c.created_at,
+          url: c.html_url,
         }));
       } catch { /* ignore */ }
     }
@@ -187,6 +242,7 @@ async function main() {
         author: data.author || "unknown",
         agent: data.agent && data.agent !== "none" ? String(data.agent) : "",
         model: data.model ? String(data.model) : "",
+        issue: Number(String(data.issue ?? "").replace(/[^0-9]/g, "")) || null,
         date: data.date ? String(data.date) : "",
         url: `${repoMeta.html_url}/blob/${repoMeta.default_branch}/${rel}`,
         summary,
@@ -196,6 +252,110 @@ async function main() {
     }
   };
   walk(findingsDir);
+
+  // --- ADRs (architecture decision records) from disk ---
+  const adrDir = path.join(REPO_ROOT, "docs", "adr");
+  const adrs = [];
+  if (existsSync(adrDir)) {
+    for (const entry of readdirSync(adrDir).sort()) {
+      if (!entry.endsWith(".md") || ["README.md", "TEMPLATE.md"].includes(entry)) continue;
+      const raw = readFileSync(path.join(adrDir, entry), "utf8");
+      adrs.push({
+        number: (raw.match(/#\s*ADR-(\d+)/) || [])[1] || (entry.match(/^(\d+)/) || [])[1] || "",
+        slug: entry.replace(/\.md$/, ""),
+        title: (raw.match(/^#\s*ADR-\d+:\s*(.+)$/m) || [])[1]?.trim() || entry.replace(/\.md$/, ""),
+        status: (raw.match(/\*\*Status:\*\*\s*(.+)$/m) || [])[1]?.trim() || "",
+        date: (raw.match(/\*\*Date:\*\*\s*(.+)$/m) || [])[1]?.trim() || "",
+        body: raw,
+        url: `${repoMeta.html_url}/blob/${repoMeta.default_branch}/docs/adr/${entry}`,
+      });
+    }
+    adrs.sort((a, b) => a.number.localeCompare(b.number));
+  }
+
+  // --- stream overview docs (the plain-language "output" of a stream) ---
+  const streamsDir = path.join(REPO_ROOT, "streams");
+  const streamDocs = [];
+  if (existsSync(streamsDir)) {
+    for (const entry of readdirSync(streamsDir).sort()) {
+      if (!entry.endsWith(".md") || ["README.md", "TEMPLATE.md"].includes(entry)) continue;
+      const { data, content } = matter(readFileSync(path.join(streamsDir, entry), "utf8"));
+      streamDocs.push({
+        stream: Number(data.stream ?? (entry.match(/^(\d+)/) || [])[1] ?? 0),
+        title: data.title || "",
+        state: data.state || "",
+        steward: data.steward || "",
+        domain: data.domain || "",
+        updated: data.updated ? String(data.updated) : "",
+        image: data.image || "",
+        body: content,
+        url: `${repoMeta.html_url}/blob/${repoMeta.default_branch}/streams/${entry}`,
+      });
+    }
+  }
+
+  // --- per-stream summary (light index layer) + provenance rollup ---
+  // Provenance comes from the .md frontmatter (agent = harness, model, author),
+  // plus GitHub actors (issue authors/assignees, PR authors). stream:<n> labels
+  // (applied to issues AND PRs by stream-sync) are the grouping key.
+  const streamLabelOf = (item) => {
+    const l = (item.labels || []).find((x) => /^stream:\d+$/i.test(x));
+    return l ? Number(l.replace(/stream:/i, "")) : null;
+  };
+  const issueStream = new Map();
+  for (const it of issues) { const s = streamLabelOf(it); if (s) issueStream.set(it.number, s); }
+  const streamAgg = new Map();
+  const ensureStream = (s) => {
+    if (!streamAgg.has(s)) streamAgg.set(s, { stream: s, title: "", domain: "", state: "", steward: "", updated: "", image: "",
+      issues: 0, openIssues: 0, mergedPRs: 0, findings: 0, agents: {}, models: {}, people: new Map() });
+    return streamAgg.get(s);
+  };
+  const addStreamPerson = (agg, p) => { if (p && p.login && !agg.people.has(p.login)) agg.people.set(p.login, { login: p.login, avatar: p.avatar, url: p.url }); };
+  for (const it of realIssues) {
+    const s = streamLabelOf(it); if (!s) continue;
+    const a = ensureStream(s);
+    a.issues++; if (it.state === "open") a.openIssues++;
+    if (it.updatedAt > a.updated) a.updated = it.updatedAt;
+    if (it.stage === "discover") { if (!a.title) a.title = it.title.replace(/^\[[^\]]+\]\s*/, ""); if (!a.state) a.state = it.status; }
+    if (!a.domain && it.domain) a.domain = it.domain;
+    addStreamPerson(a, it.author); (it.assignees || []).forEach((p) => addStreamPerson(a, p));
+  }
+  for (const p of prs) {
+    const s = streamLabelOf(p); if (!s) continue;
+    const a = ensureStream(s);
+    if (p.merged) a.mergedPRs++;
+    if (p.updatedAt > a.updated) a.updated = p.updatedAt;
+    addStreamPerson(a, p.author);
+    for (const reviewer of reviewPeopleByPr.get(p.number)?.values() ?? []) addStreamPerson(a, reviewer);
+  }
+  for (const f of findings) {
+    const s = f.issue ? issueStream.get(f.issue) : null; if (!s) continue;
+    const a = ensureStream(s);
+    a.findings++;
+    const harness = f.agent || "human";
+    a.agents[harness] = (a.agents[harness] || 0) + 1;
+    if (f.model) a.models[f.model] = (a.models[f.model] || 0) + 1;
+    const login = canonicalAuthor(f.author);
+    if (login && login !== "unknown" && !a.people.has(login)) a.people.set(login, { login, avatar: `https://github.com/${login}.png`, url: `https://github.com/${login}` });
+  }
+  for (const d of streamDocs) {
+    const a = ensureStream(d.stream);
+    if (d.title) a.title = d.title;
+    if (d.state) a.state = d.state;
+    if (d.steward) {
+      a.steward = d.steward;
+      const login = String(d.steward).replace(/^@/, "");
+      if (login) addStreamPerson(a, { login, avatar: `https://github.com/${login}.png`, url: `https://github.com/${login}` });
+    }
+    if (!a.domain && d.domain) a.domain = d.domain;
+    if (d.image) a.image = d.image;
+  }
+  const streamsSummary = [...streamAgg.values()].map((a) => ({
+    stream: a.stream, title: a.title || `Stream #${a.stream}`, domain: a.domain, state: a.state, steward: a.steward, updated: a.updated, image: a.image,
+    issues: a.issues, openIssues: a.openIssues, mergedPRs: a.mergedPRs, findings: a.findings,
+    agents: a.agents, models: a.models, people: [...a.people.values()],
+    hasOverview: streamDocs.some((d) => d.stream === a.stream && (d.body || "").trim().length > 0),
+  })).sort((x, y) => (y.updated || "").localeCompare(x.updated || "") || x.stream - y.stream);
 
   // --- leaderboard ---
   const people = new Map();
@@ -215,7 +375,14 @@ async function main() {
   for (const p of prs) { const r = ensure(p.author); if (r) { r.prsOpened++; if (p.merged) r.prsMerged++; bumpActivity(r, p.updatedAt); } }
   for (const c of commitContributors) { const r = ensure(person(c)); if (r) r.commits += c.contributions || 0; }
   for (const f of findings) {
-    const login = f.author && f.author !== "unknown" ? f.author.replace(/^@/, "") : null;
+    // Attribute a finding to the GitHub user who OPENED THE PR that added it —
+    // the reliable identity. Fall back to the frontmatter author only if no PR
+    // maps to the file, and never credit a harness name (codex/claude/…).
+    let login = pathToAuthor.get(f.path)?.login || null;
+    if (!login && f.author && f.author !== "unknown") {
+      const c = canonicalAuthor(f.author);
+      if (c && !HARNESS.has(c.toLowerCase())) login = c;
+    }
     if (!login) continue;
     if (!people.has(login)) people.set(login, newPerson(login, `https://github.com/${login}.png`, `https://github.com/${login}`));
     const r = people.get(login); r.findingsAuthored++; if (f.domain) r.domains.add(f.domain); bumpActivity(r, f.date);
@@ -231,7 +398,7 @@ async function main() {
     .map((p) => {
       const researchScore = p.findingsAuthored * 5 + p.prsMerged * 3 + p.issuesAssigned * 2 + p.prsOpened + Math.min(p.commits, 50);
       const reviewScore = p.reviewsGiven * 4;
-      return { ...p, domains: [...p.domains], researchScore, reviewScore, score: researchScore + reviewScore };
+      return { ...p, name: mostCommonName(p.login), domains: [...p.domains], researchScore, reviewScore, score: researchScore + reviewScore };
     })
     .filter((p) => p.score > 0)
     .sort((a, b) => b.score - a.score);
@@ -269,6 +436,67 @@ async function main() {
       meta: i.isPR ? (i.merged ? "merged" : i.state) : i.stage !== "none" ? i.stage : i.state,
     }));
 
+  // --- live comment feed + active actors ---
+  // A flat, newest-first stream of comments across every issue and PR, plus a
+  // short list of who's been active recently — powering the /live feed and the
+  // dashboard's "Live activity" widget. Fully static: the client polls this
+  // snapshot, and a new comment triggers a rebuild (see pages.yml).
+  //
+  // Every active contributor on this project is currently an agent — humans are
+  // the judgement layer (they review and steward), while the volume of commits,
+  // comments and PRs is produced by agents running on contributors' own tokens.
+  // So we simply treat all non-bookkeeping-bot actors as agents. When humans
+  // start participating directly (commenting/committing as themselves), restore
+  // per-actor detection here (a [bot] check + an AGENT_LOGINS allowlist).
+  const isAgent = (login) => !!login && !BOTS.has(login);
+
+  // Strip markdown/URLs down to a readable one-line snippet for the feed.
+  const snippet = (s) =>
+    (s || "")
+      .replace(/```[\s\S]*?```/g, " ")
+      .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
+      .replace(/https?:\/\/\S+/g, " ")
+      .replace(/[#>*`_~|]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 240);
+
+  const comments = [];
+  for (const it of issues) {
+    if (!it.commentsList) continue;
+    for (const c of it.commentsList) {
+      if (BOTS.has(c.author)) continue; // drop label/dependency bookkeeping noise
+      comments.push({
+        author: c.author,
+        avatar: c.avatar,
+        isAgent: isAgent(c.author),
+        body: snippet(c.body),
+        createdAt: c.createdAt,
+        url: c.url || it.url,
+        issueNumber: it.number,
+        issueTitle: it.title,
+        isPR: it.isPR,
+      });
+    }
+  }
+  comments.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  const recentComments = comments.slice(0, 60);
+
+  // Distinct actors seen recently (comments + issue/PR updates), newest first.
+  const actorSeen = new Map();
+  const noteActor = (login, avatar, at) => {
+    if (!login || BOTS.has(login) || !at) return;
+    const t = new Date(at).getTime();
+    if (Number.isNaN(t)) return;
+    const cur = actorSeen.get(login);
+    if (!cur || t > new Date(cur.at).getTime()) {
+      actorSeen.set(login, { login, avatar: avatar || cur?.avatar || "", isAgent: isAgent(login), at: new Date(at).toISOString() });
+    }
+  };
+  for (const c of comments) noteActor(c.author, c.avatar, c.createdAt);
+  for (const it of issues) noteActor(it.author?.login, it.author?.avatar, it.updatedAt);
+  const activeActors = [...actorSeen.values()].sort((a, b) => new Date(b.at) - new Date(a.at)).slice(0, 12);
+
   const snapshot = {
     generatedAt: new Date().toISOString(),
     repo: { owner: OWNER, name: NAME, url: repoMeta.html_url, description: repoMeta.description || "", homepage: repoMeta.homepage || "" },
@@ -285,6 +513,10 @@ async function main() {
       sources: new Set(sources.map((s) => s.url)).size,
       byStage: count(openIssues, "stage"),
       byStatus: count(openIssues, "status"),
+      // Synthesis-gate visibility (#292): drained streams queued for (or
+      // parked at) the human G1 gate — the site surfaces backlog depth.
+      synthesisQueue: openIssues.filter((i) => i.status === "needs-synthesis").length,
+      awaitingDirection: openIssues.filter((i) => i.status === "awaiting-direction").length,
       byDomain: count(openIssues, "domain"),
     },
     pipeline,
@@ -294,11 +526,30 @@ async function main() {
     findings,
     sources,
     activity,
+    comments: recentComments,
+    activeActors,
+    adrs,
+    streamDocs,
+    streamsSummary,
   };
 
   mkdirSync(OUT_DIR, { recursive: true });
   writeFileSync(path.join(OUT_DIR, "snapshot.json"), JSON.stringify(snapshot, null, 2));
-  console.log(`Wrote snapshot: ${realIssues.length} issues, ${prs.length} PRs, ${findings.length} findings, ${leaderboard.length} contributors, ${snapshot.stats.sources} sources.`);
+  // Light, standalone streams index — the overview page can fetch this instead
+  // of the full snapshot as the number of streams grows.
+  writeFileSync(path.join(OUT_DIR, "streams-summary.json"), JSON.stringify({ generatedAt: snapshot.generatedAt, streams: streamsSummary }, null, 2));
+  console.log(`Wrote snapshot: ${realIssues.length} issues, ${prs.length} PRs, ${findings.length} findings, ${leaderboard.length} contributors, ${snapshot.stats.sources} sources, ${recentComments.length} recent comments, ${activeActors.length} active actors.`);
 }
 
-main().catch((e) => { console.error(e); process.exit(1); });
+main().catch((e) => {
+  console.error("build-data failed:", e?.message || e);
+  // Don't take the whole site deploy down over a transient GitHub API failure
+  // (secondary rate limits are common under heavy agent activity). If a
+  // previous snapshot exists (it's committed), keep it and let the build ship
+  // last-known-good data; only hard-fail if there's nothing to fall back to.
+  if (existsSync(path.join(OUT_DIR, "snapshot.json"))) {
+    console.warn("Keeping previous snapshot.json so the site still deploys with last-known-good data.");
+    process.exit(0);
+  }
+  process.exit(1);
+});

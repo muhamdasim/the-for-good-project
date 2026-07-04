@@ -36,7 +36,41 @@ function parseFrontmatter(text) {
 }
 
 const isPlaceholder = (v) => !v || /[<>]/.test(v) || /YYYY-MM-DD|exact model id|your name or handle|the question you answered/i.test(v);
-const hasSection = (body, name) => new RegExp(`^#{2,3}\\s*${name}`, "mi").test(body);
+
+// Harness artifacts and placeholder citations (#290). Agent harnesses sometimes
+// leak tool-wrapper tags (XML-ish call/result envelopes) or unfilled citation
+// stubs into the markdown they publish. Neither has any legitimate place in a
+// finding/solution/analysis doc, so any match is a hard failure. Checked
+// against the WHOLE file (frontmatter included) — leaks land anywhere.
+const ARTIFACT_PATTERNS = [
+  [/<\/?antml[:_][a-z]/i, "tool-wrapper artifact tag (antml:*)"],
+  [/<\/?(?:function_calls?|function_results?|fnr|invoke|tool_use|tool_result|search_results?|system-reminder|automated_reminder)\b/i, "tool-wrapper artifact tag"],
+  [/\[\s*(?:WebSearch|WebFetch|TODO|TBD|FIXME|CITATION NEEDED)\b[^\]]*\]/i, "placeholder citation stub"],
+  // A bare "[source]/[ref]/…" stub, but NOT a markdown reference link: exempt
+  // both the inline reference "[source][1]" (next char "[") / "[source](url)"
+  // (next char "(") and the reference DEFINITION line "[source]: https://…"
+  // (next char ":").
+  [/\[(?:source|citation|ref|link|url)\](?!\s*[([:])/i, "bare placeholder citation stub (no href)"],
+  // An unfilled "[...]" citation placeholder — but ONLY as link text
+  // ("[...](" / "[...][") or standing alone on its own line/bullet. A bare
+  // "[...]" embedded in prose is standard quotation-elision (e.g. quoting a
+  // statute with omitted words) and must NOT be flagged (#290, review of #312).
+  [/\[(?:\.\.\.|…)\](?=\s*[([])/, "unfilled '[...]' placeholder link"],
+  [/^[ \t]*(?:[-*+]\s+)?\[(?:\.\.\.|…)\][ \t]*$/m, "unfilled '[...]' placeholder (standalone)"],
+  [/\]\(\s*\)/, "markdown link with an EMPTY href"],
+  [/\]\(\s*<?(?:url|link|href|source)>?\s*\)/i, "markdown link with a placeholder href"],
+  [/\]\(\s*(?:https?:\/\/)?(?:www\.)?example\.(?:com|org|net)\b[^)]*\)/i, "markdown link pointing at example.com (placeholder)"],
+];
+
+function checkArtifacts(text, errs) {
+  for (const [re, why] of ARTIFACT_PATTERNS) {
+    const m = text.match(re);
+    if (m) errs.push(`${why}: '${m[0].slice(0, 60)}' — harness/placeholder output must not be published (see #290)`);
+  }
+}
+// Numbered headings (e.g. "## 5. Confidence & limits") are common in analysis/ docs —
+// allow an optional leading "N. " before the section name.
+const hasSection = (body, name) => new RegExp(`^#{2,3}\\s*(?:\\d+\\.\\s*)?${name}`, "mi").test(body);
 const hasCitation = (body) => /\[[^\]]+\]\(https?:\/\/[^)\s]+\)/.test(body);
 
 function checkCommon(fm, errs) {
@@ -53,10 +87,12 @@ function checkCommon(fm, errs) {
 
 function validateFinding(file) {
   const errs = [];
-  const parsed = parseFrontmatter(readFileSync(file, "utf8"));
+  const text = readFileSync(file, "utf8");
+  const parsed = parseFrontmatter(text);
   if (!parsed) return ["no YAML frontmatter (--- block) at the top of the file"];
   const { fm, body } = parsed;
   checkCommon(fm, errs);
+  checkArtifacts(text, errs);
   if (!LEVELS.includes(fm.confidence)) errs.push(`frontmatter 'confidence' must be High/Medium/Low (got '${fm.confidence ?? ""}')`);
   const folder = path.basename(path.dirname(file));
   if (DOMAINS.includes(folder) && fm.domain && fm.domain !== folder)
@@ -70,19 +106,47 @@ function validateFinding(file) {
 
 function validateSolution(file) {
   const errs = [];
-  const parsed = parseFrontmatter(readFileSync(file, "utf8"));
+  const text = readFileSync(file, "utf8");
+  const parsed = parseFrontmatter(text);
   if (!parsed) return ["no YAML frontmatter (--- block) at the top of the file"];
   const { fm } = parsed;
   checkCommon(fm, errs);
+  checkArtifacts(text, errs);
   if (!LEVELS.includes(fm.feasibility)) errs.push(`frontmatter 'feasibility' must be High/Medium/Low (got '${fm.feasibility ?? ""}')`);
   if (isPlaceholder(fm.based_on) || fm.based_on === "[]") errs.push("frontmatter 'based_on' must link the finding(s) this builds on");
   return errs;
 }
 
+// analysis/ docs (ADR-0004): project-level analysis, distinct from research
+// findings/solutions. No `domain` or `confidence` frontmatter (those are
+// finding-specific) — instead: title, type: analysis, status, author, agent,
+// model, date; at least one inline citation; and a "Confidence & limits"
+// section (numbered headings like "## 5. Confidence & limits" are allowed).
+function validateAnalysis(file) {
+  const errs = [];
+  const text = readFileSync(file, "utf8");
+  const parsed = parseFrontmatter(text);
+  if (!parsed) return ["no YAML frontmatter (--- block) at the top of the file"];
+  const { fm, body } = parsed;
+  checkArtifacts(text, errs);
+  for (const f of ["title", "author", "agent", "date"]) {
+    if (isPlaceholder(fm[f])) errs.push(`frontmatter '${f}' is missing or still a placeholder`);
+  }
+  if (fm.type !== "analysis") errs.push(`frontmatter 'type' must be 'analysis' (got '${fm.type ?? ""}')`);
+  if (isPlaceholder(fm.status)) errs.push("frontmatter 'status' is missing or still a placeholder");
+  if (fm.date && !/^\d{4}-\d{2}-\d{2}$/.test(fm.date)) errs.push(`frontmatter 'date' must be YYYY-MM-DD (got '${fm.date}')`);
+  if (fm.agent && fm.agent.toLowerCase() !== "none" && isPlaceholder(fm.model))
+    errs.push(`frontmatter 'model' is required unless agent is 'none'`);
+  if (!hasSection(body, "Confidence\\s*&\\s*limits")) errs.push("missing '## Confidence & limits' section (required by ADR-0004)");
+  if (!hasCitation(body)) errs.push("no citations found — analysis docs need at least one inline source link for factual claims (ADR-0004)");
+  return errs;
+}
+
 const findings = walk(path.join(ROOT, "research", "findings"));
 const solutions = walk(path.join(ROOT, "solutions"));
+const analyses = walk(path.join(ROOT, "analysis"));
 let failed = 0, checked = 0;
-for (const [files, fn, kind] of [[findings, validateFinding, "finding"], [solutions, validateSolution, "solution"]]) {
+for (const [files, fn, kind] of [[findings, validateFinding, "finding"], [solutions, validateSolution, "solution"], [analyses, validateAnalysis, "analysis"]]) {
   for (const file of files) {
     checked++;
     const rel = path.relative(ROOT, file);
@@ -90,6 +154,6 @@ for (const [files, fn, kind] of [[findings, validateFinding, "finding"], [soluti
     if (errs.length) { failed++; console.log(`\n✗ ${rel}`); for (const e of errs) console.log(`    - ${e}`); }
   }
 }
-if (checked === 0) { console.log("No findings or solutions to validate."); process.exit(0); }
+if (checked === 0) { console.log("No findings, solutions, or analysis docs to validate."); process.exit(0); }
 if (failed) { console.log(`\n${failed}/${checked} file(s) failed validation. Fix the items above.`); process.exit(1); }
-console.log(`✓ All ${checked} finding/solution file(s) valid.`);
+console.log(`✓ All ${checked} finding/solution/analysis file(s) valid.`);

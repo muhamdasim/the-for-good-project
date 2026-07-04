@@ -1,5 +1,7 @@
 # Contributing
 
+> One-page map of how everything fits: [docs/OVERVIEW.md](docs/OVERVIEW.md).
+
 Welcome. This is the method that keeps The For Good Project useful. It's short on purpose — read it once and you're ready.
 
 The work here informs real decisions about real people. That's why the bar is "cited and honest," not "fast and confident."
@@ -17,7 +19,7 @@ Every piece of work is a GitHub Issue moving through four stages:
 
 Issues link forward: a Discover issue spawns Research issues; a Research finding feeds an Ideate issue; a chosen idea becomes a Build issue. Always link the issue you came from (`Part of #123`) so the chain stays traceable.
 
-Everything descending from one Discover issue is a **stream** (tracked by an auto-applied `stream:<n>` label and a plain-language overview in [`streams/`](streams/README.md)). Streams pass through **human gates**: a person must synthesise the research before ideation starts (G1) and approve a solution before anything is built (G2) — see [`docs/STREAMS.md`](docs/STREAMS.md). Agents do the volume; humans do the judgement.
+Everything descending from one Discover issue is a **stream** (tracked by an auto-applied `stream:<n>` label and a plain-language overview in [`streams/`](streams/README.md)). Streams pass through **human gates**: an agent drafts the synthesis, then a person reviews it and sets direction before ideation starts (G1) and approve a solution before anything is built (G2) — see [`docs/STREAMS.md`](docs/STREAMS.md). Agents do the volume; humans do the judgement.
 
 ## The workflow
 
@@ -33,12 +35,14 @@ Don't have write access to labels? No problem — just say in the issue comment 
 
 **No write access at all?** (most contributors) Fork the repo, push your branch to the fork, and open the PR across repos — full commands are in [`AGENTS.md`](AGENTS.md#no-write-access-most-contributors). You can also adversarially review others' PRs from a fork; a maintainer's `merge_ready.sh` validates outside reviews and merges what qualifies.
 
+**New to working on a shared repo?** If you've only ever used git for your own projects — never pushed to a shared `main`, opened a pull request, or juggled several branches at once — [`docs/GIT-WORKFLOW.md`](docs/GIT-WORKFLOW.md) covers the git mechanics (branch-per-issue, worktrees for multiple windows, staying in sync, cleanup) without re-explaining the pipeline above.
+
 ## The research method
 
 This applies most strictly to Research, but the spirit holds everywhere.
 
 1. **Clarify the question.** State exactly what you're answering in one sentence. If the issue is vague, narrow it and say how.
-2. **Cite every claim.** Every factual statement gets at least one source — a link, a document, a dataset. No citation, no claim. Prefer official and current NZ sources (government, Stats NZ, councils, established NGOs, peer-reviewed work) over blogs and secondary reporting.
+2. **Cite every claim.** Every factual statement gets at least one source — a link, a document, a dataset. No citation, no claim. Prefer official and current NZ sources (government, Stats NZ, councils, established NGOs, peer-reviewed work) over blogs and secondary reporting. If a source 403s or bot-blocks, escalate through the fetch ladder in [`AGENTS.md`](AGENTS.md#tips) ([ADR-0006](docs/adr/0006-fetch-proxy-browser-management.md)) — a blocked response is tooling, not a dead link.
 3. **Verify the surprising ones.** Anything counter-intuitive, load-bearing, or likely to be quoted needs **two independent sources**. If you can only find one, say so and flag it.
 4. **Mark your confidence.** Every finding is tagged **High**, **Medium**, or **Low**:
    - **High** — multiple strong, current sources agree; you'd stake a decision on it.
@@ -56,8 +60,21 @@ A finding that honestly reads _"Low confidence, one dated source, needs a Stats 
 | A cited research finding | `research/findings/<domain>/<slug>.md` | [`research/TEMPLATE.md`](research/TEMPLATE.md) |
 | A proposed solution | `solutions/<slug>.md` | [`solutions/TEMPLATE.md`](solutions/TEMPLATE.md) |
 | An implementation | `projects/<slug>/` | [`projects/README.md`](projects/README.md) |
+| A project-level analysis or operating plan | `analysis/<slug>.md` | [`analysis/README.md`](analysis/README.md) |
+| A finding **about this project's own process, gates, or governance** | `analysis/<slug>.md` — **never** `research/findings/` | Process observations aren't NZ research; putting them in `findings/` triggers the full citation gate and stalls review |
 
 `<domain>` is one of the folders in `research/findings/` (child-welfare, grant-access, civic-transparency, ai-policy, biosecurity, …). `<slug>` is short-kebab-case, e.g. `grant-discovery-for-small-charities.md`.
+
+### Audience is signalled by extension, not a suffix
+
+Some documents ship in two formats: a Markdown original for LLMs and contributors, and a PDF for humans who want a formatted read. When they do, both use the **same kebab-case slug** and the audience is implied by the extension — never a `-human` / `-llm` tag:
+
+- **`.md` is the canonical source of truth.** Edit it; review, diff, and cite it.
+- **`.pdf` (or any rendered format) is a read-only companion**, generated from the `.md`. Never hand-edit it — if the two disagree, the `.md` wins; regenerate the export.
+
+This keeps the project's one-source-of-truth principle intact: the Markdown is the database, everything else is a view of it. See [`analysis/README.md`](analysis/README.md) for a worked example.
+
+The `analysis/` artifact type and rendered-companion convention are recorded in [`ADR-0004`](docs/adr/0004-analysis-documents-and-rendered-companions.md). Analysis files follow the cited-and-honest method, and `npm run validate` checks them too — provenance frontmatter (`title`, `type: analysis`, author/agent/model, status, date), a "Confidence & limits" section, and at least one inline citation — alongside findings and solutions.
 
 ## Pull request checklist
 

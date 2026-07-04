@@ -1,5 +1,5 @@
 import { NavLink, Link, useLocation } from "react-router-dom";
-import { Moon, Sun, Plus, Menu, X, ChevronDown } from "lucide-react";
+import { Moon, Sun, Menu, X, ChevronDown } from "lucide-react";
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem } from "@/components/ui/dropdown-menu";
@@ -12,8 +12,11 @@ type NavGroup = { label: string; items: NavItem[] };
 
 const LINKS: NavItem[] = [
   { to: "/", label: "Dashboard", end: true },
-  { to: "/board", label: "Board" },
   { to: "/partners", label: "For partners" },
+  { to: "/live", label: "Live" },
+  { to: "/board", label: "Board" },
+  { to: "/streams", label: "Streams" },
+  { to: "/team", label: "Who we are" },
 ];
 
 const GROUPS: NavGroup[] = [
@@ -29,8 +32,9 @@ const GROUPS: NavGroup[] = [
     label: "Community",
     items: [
       { to: "/leaderboard", label: "Leaderboard" },
-      { to: "/contribute", label: "Get started" },
+      { to: "/contribute", label: "Contribute" },
       { to: "/methodology", label: "Method" },
+      { to: "/decisions", label: "Decisions" },
     ],
   },
 ];
@@ -101,9 +105,6 @@ export function Header({ repoUrl }: { repoUrl?: string }) {
               <Button variant="ghost" size="icon" aria-label="GitHub"><GitHubIcon className="h-4 w-4" /></Button>
             </a>
           ) : null}
-          <Link to="/submit" className="hidden sm:block">
-            <Button variant="brand" size="sm"><Plus className="h-4 w-4" /> Submit</Button>
-          </Link>
           <Button variant="ghost" size="icon" className="md:hidden" onClick={() => setOpen((o) => !o)} aria-label="Menu">
             {open ? <X className="h-4 w-4" /> : <Menu className="h-4 w-4" />}
           </Button>
@@ -130,9 +131,6 @@ export function Header({ repoUrl }: { repoUrl?: string }) {
                 ))}
               </div>
             ))}
-            <Link to="/submit" onClick={() => setOpen(false)} className="mt-2">
-              <Button variant="brand" className="w-full"><Plus className="h-4 w-4" /> Submit an issue</Button>
-            </Link>
           </div>
         </nav>
       ) : null}

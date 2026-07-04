@@ -1,10 +1,11 @@
 ---
 stream: 0                      # the root Discover issue number
 title: ""                      # plain-language name, e.g. "Small charities miss grants they qualify for"
-state: researching             # framing | researching | needs-synthesis | ideating | building | shipped
+state: researching             # framing | researching | needs-synthesis | awaiting-direction | ideating | building | shipped
 steward: ""                    # GitHub handle of the human who owns direction
 domain: ""                     # child-welfare | grant-access | civic-transparency | ai-policy | biosecurity | other
 updated: YYYY-MM-DD
+image: ""                      # site path, e.g. /images/streams/<stream-slug>.jpg
 ---
 
 <!--
@@ -31,6 +32,22 @@ a list of *things we now know*:
 ## What we're not sure about yet
 
 - Open question or weak spot in the evidence, in plain language.
+
+## What we could do about it
+
+<!--
+2-4 candidate outcomes the evidence could support — options for the steward,
+drafted by the synthesis agent. NOT a decision or a recommendation: the
+steward edits or discards these freely and decides under "Where this is
+heading". Each option: what it is (one plain-language sentence), who it would
+help, rough effort for a small volunteer team (Small/Medium/Large), which
+findings support it (linked, confidence carried), and what would need to be
+true for it to work.
+-->
+
+- **{Option, one plain-language sentence}** — helps: {who}. Effort:
+  Small/Medium/Large. Supported by [finding](../research/findings/...)
+  (confidence: High/Medium/Low). Would need: {what must be true for this to work}.
 
 ## Where this is heading
 
